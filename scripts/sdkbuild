@@ -41,7 +41,7 @@ gen_image_upgrade()
         ${BUILD_DIR}/tools/gen_upgrade -f ${cfgpath}/packagefile_USB.cfg -t $PRODUCT -v $COMPILE_VER -m $COMMIT
     fi
 	rm -fr usb_up.aup *.vfat;
-	rm -fr app sysimages tools app.* *.kdimg;
+	rm -fr app tools app.* *.kdimg;
 }
 
 gen_kdimage sysimage-spinand256m.kdimg

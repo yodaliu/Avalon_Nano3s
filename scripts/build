@@ -10,75 +10,243 @@ PRODUCT="Nano3s"
 echo && echo "[INFO] Source path: $SRC_DIR"
 COMMIT=`git describe --match=NeVeRmAtCh --always --abbrev=7 --dirty=t`
 
+# ---------------------------------------------------------------------------
+# Source layout: extracted from resource tarballs into output/src/
+# ---------------------------------------------------------------------------
+RTT_SRC="${BUILDIMG_DIR}/src/rtt"
+OPENSBI_SRC="${BUILDIMG_DIR}/src/opensbi"
+LINUX_SRC="${BUILDIMG_DIR}/src/linux"
+
+MKIMAGE="${BUILDIMG_DIR}/tools/mkimage"
+K230_GZIP="${BUILDIMG_DIR}/tools/k230_priv_gzip"
+FIRMWARE_GEN="${BUILDIMG_DIR}/tools/firmware_gen.py"
+
+DOWNLOAD_URL="https://kendryte-download.canaan-creative.com/k230/"
+
+# ---------------------------------------------------------------------------
+
+prepare_musl_toolchain(){
+    local MUSL_TOOLCHAIN_TAR="riscv64-unknown-linux-musl-rv64imafdcv-lp64d-20230420.tar.bz2"
+    local MUSL_TC_DIR="${SRC_DIR}/toolchain"
+    local MUSL_TC="${MUSL_TC_DIR}/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin"
+    local TAR="${MUSL_TC_DIR}/${MUSL_TOOLCHAIN_TAR}"
+    local MUSL_TC_URL=${DOWNLOAD_URL}/toolchain/${MUSL_TOOLCHAIN_TAR}
+
+    if [ ! -f "${MUSL_TC}/riscv64-unknown-linux-musl-gcc" ]; then
+        echo "[INFO] Extracting musl toolchain..."
+        if [ ! -f "${TAR}" ]; then
+            wget -q --show-progress -P ${MUSL_TC_DIR} ${MUSL_TC_URL};
+        fi
+        tar jxf "${TAR}" -C "${MUSL_TC_DIR}"
+    fi
+
+    if [ ! -f "${MUSL_TC}/riscv64-unknown-linux-musl-gcc" ]; then
+        echo "[ERROR] musl gcc not found at ${MUSL_TC}"
+        exit 1
+    fi
+    echo "[INFO] musl gcc: $(${MUSL_TC}/riscv64-unknown-linux-musl-gcc --version | head -1)"
+}
+
 prepare_toolchain(){
-    TOOLCHAIN="Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V2.6.0"
-    TOOLCHAIN_TAR=${TOOLCHAIN}.tar.bz2
-    DOWNLOAD_URL="https://kendryte-download.canaan-creative.com/k230/"
-    TOOLCHAIN_URL=${DOWNLOAD_URL}/toolchain/${TOOLCHAIN_TAR}
+    local TOOLCHAIN="Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V2.6.0"
+    local TOOLCHAIN_TAR="${TOOLCHAIN}.tar.bz2"
+    local TC_DIR="${SRC_DIR}/toolchain"
+    local TOOLCHAIN_URL=${DOWNLOAD_URL}/toolchain/${TOOLCHAIN_TAR}
 
-    if [ ! -d ${SRC_DIR}/toolchain ]; then
-        mkdir -p ${SRC_DIR}/toolchain
+    if [ ! -d "${TC_DIR}/${TOOLCHAIN}/bin" ]; then
+        echo "[INFO] Extracting glibc toolchain..."
+        if [ ! -f "${TC_DIR}/${TOOLCHAIN_TAR}" ]; then
+            wget -q --show-progress -P ${TC_DIR} ${TOOLCHAIN_URL};
+        fi
+        tar jxf "${TC_DIR}/${TOOLCHAIN_TAR}" -C "${TC_DIR}"
     fi
 
-    ### download toolchain
-    if [ ! -d ${SRC_DIR}/toolchain/$TOOLCHAIN/bin ]; then
-        echo "download toolchain and extract ..."
-        [ -e ${SRC_DIR}/toolchain/${TOOLCHAIN_TAR} ] && rm  ${SRC_DIR}/toolchain/${TOOLCHAIN_TAR}
-        wget -q --show-progress -P ${SRC_DIR}/toolchain ${TOOLCHAIN_URL};
-        tar jxf ${SRC_DIR}/toolchain/${TOOLCHAIN_TAR} -C ${SRC_DIR}/toolchain
-    fi
-
-    if [ ! -e ${SRC_DIR}/toolchain/$TOOLCHAIN/bin/riscv64-unknown-linux-gnu-gcc ];then
-        echo "toolchain not exist, please retry!"
+    if [ ! -e "${TC_DIR}/${TOOLCHAIN}/bin/riscv64-unknown-linux-gnu-gcc" ]; then
+        echo "[ERROR] glibc gcc not found at ${TC_DIR}/${TOOLCHAIN}/bin"
         exit 1
     fi
 
-    export PATH=${SRC_DIR}/toolchain/${TOOLCHAIN}/bin:$PATH
+    export PATH="${TC_DIR}/${TOOLCHAIN}/bin:$PATH"
+    GNU_CC="riscv64-unknown-linux-gnu-"
+
+    echo "[INFO] gcc: $(${TC_DIR}/${TOOLCHAIN}/bin/riscv64-unknown-linux-gnu-gcc --version | head -1)"
 }
 
 prepare_resource(){
-    rm -fr ${BUILDIMG_DIR}; mkdir -p ${BUILDIMG_DIR}/
-    find ${RESOURCE_DIR}/ -type f -name "*.tar.gz" -exec tar xzf {} -C ${BUILDIMG_DIR} \;
+    local LINUX_BASE_TAR="${RESOURCE_DIR}/linux-5.10.4.tar.gz"
+    local LINUX_BASE_URL="https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.4.tar.gz"
+    local LINUX_PATCHES_TAR="${RESOURCE_DIR}/patches-5.10.4.tar.gz"
+    local PATCH_TMP PATCH_DIR
+    local -a patch_list
+
+    rm -fr "${BUILDIMG_DIR}"; mkdir -p "${BUILDIMG_DIR}/"
+
+    # Extract binary resource tarballs (sysimages, app, tools)
+    find "${RESOURCE_DIR}/" -type f -name "*.tar.gz" \
+        ! -name "opensbi-*.tar.gz" \
+        ! -name "linux-*.tar.gz" \
+        ! -name "rtt-*.tar.gz" \
+        ! -name "patches-*.tar.gz" \
+        -exec tar xzf {} -C "${BUILDIMG_DIR}" \;
+
+    # Extract source tarballs into output/src/
+    echo "[INFO] Extracting source tarballs..."
+    mkdir -p "${BUILDIMG_DIR}/src"
+    for src_tar in "${RESOURCE_DIR}"/opensbi-*.tar.gz \
+                   "${RESOURCE_DIR}"/rtt-*.tar.gz; do
+        [ -f "${src_tar}" ] && tar xzf "${src_tar}" -C "${BUILDIMG_DIR}/src"
+    done
+
+    if [ ! -f "${LINUX_BASE_TAR}" ]; then
+        echo "[WARN] Linux base tarball not found: ${LINUX_BASE_TAR}"
+        echo "[INFO] Downloading Linux base tarball from ${LINUX_BASE_URL}"
+        wget -q --show-progress -O "${LINUX_BASE_TAR}" "${LINUX_BASE_URL}"
+    fi
+
+    echo "[INFO] Extracting Linux base tarball: ${LINUX_BASE_TAR}"
+    tar xzf "${LINUX_BASE_TAR}" -C "${BUILDIMG_DIR}/src"
+
+    # Normalize extracted Linux source dir to ${LINUX_SRC}
+    if [ -d "${BUILDIMG_DIR}/src/linux-5.10.4" ]; then
+        mv "${BUILDIMG_DIR}/src/linux-5.10.4" "${LINUX_SRC}"
+    elif [ -d "${LINUX_SRC}" ]; then
+        :
+    else
+        echo "[ERROR] Linux source dir not found after extraction"
+        exit 1
+    fi
+
+    if [ -f "${LINUX_PATCHES_TAR}" ]; then
+        echo "[INFO] Applying Linux patch series: ${LINUX_PATCHES_TAR}"
+        PATCH_TMP=$(mktemp -d)
+        tar xzf "${LINUX_PATCHES_TAR}" -C "${PATCH_TMP}"
+        PATCH_DIR=$(find "${PATCH_TMP}" -maxdepth 1 -type d -name "patches-*" | head -n 1)
+        [ -z "${PATCH_DIR}" ] && PATCH_DIR="${PATCH_TMP}"
+
+        mapfile -t patch_list < <(find "${PATCH_DIR}" -maxdepth 1 -type f -name "*.patch" | sort)
+        if [ ${#patch_list[@]} -eq 0 ]; then
+            echo "[ERROR] No patch files found in ${LINUX_PATCHES_TAR}"
+            rm -rf "${PATCH_TMP}"
+            exit 1
+        fi
+
+        (
+            cd "${LINUX_SRC}"
+            git init -q
+            git config user.name "sdk-build"
+            git config user.email "sdk-build@local"
+            git add -A
+            git commit -q -m "linux base"
+            for patch_file in "${patch_list[@]}"; do
+                echo "[INFO]   applying $(basename "${patch_file}")"
+                git am -q "${patch_file}"
+            done
+            rm -rf .git
+        )
+        rm -rf "${PATCH_TMP}"
+    else
+        echo "[WARN] Linux patch tarball not found, skip patch apply: ${LINUX_PATCHES_TAR}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Build rtt_system.bin from RT-Smart + OpenSBI source
+# ---------------------------------------------------------------------------
+build_rtt_system(){
+    local OUTDIR="${BUILDIMG_DIR}/sysimages"
+
+    echo && echo "[INFO] -------------------- rtt_system.bin (factory, from sysimages tarball) --------------------"
+
+    if [ ! -f "${OUTDIR}/rtt_system.bin" ]; then
+        echo "[ERROR] rtt_system.bin not found in ${OUTDIR} — check sysimages tarball"
+        exit 1
+    fi
+
+    echo "[INFO] rtt_system.bin -> $(ls -lh ${OUTDIR}/rtt_system.bin | awk '{print $5, $9}')"
+}
+
+# ---------------------------------------------------------------------------
+# Build linux_system.bin from Linux kernel + OpenSBI source
+# ---------------------------------------------------------------------------
+build_linux_system(){
+    local LINUX_DIR="${LINUX_SRC}"
+    local LINUX_BUILD="${LINUX_DIR}/build"
+    local OPENSBI_DIR="${OPENSBI_SRC}"
+    local OPENSBI_BUILD="${OPENSBI_DIR}/build_little"
+    local FW_PAYLOAD="${OPENSBI_BUILD}/platform/generic/firmware/fw_payload.bin"
+    local NANO3S_DTB="${LINUX_SRC}/arch/riscv/boot/dts/kendryte/nano3s.dtb"
+    local OUTDIR="${BUILDIMG_DIR}/sysimages"
+    local TMPD
+
+    echo && echo "[INFO] -------------------- build linux_system.bin --------------------"
+
+    # Build Linux kernel
+    echo "[INFO] Building Linux kernel..."
+    mkdir -p "${LINUX_BUILD}"
+    make -C "${LINUX_DIR}" O="${LINUX_BUILD}" \
+        ARCH=riscv CROSS_COMPILE="${GNU_CC}" \
+        nano3s_defconfig
+    make -C "${LINUX_DIR}" O="${LINUX_BUILD}" \
+        ARCH=riscv CROSS_COMPILE="${GNU_CC}" \
+        -j$(nproc)
+
+    # Build little-core OpenSBI with Linux payload
+    echo "[INFO] Building little-core OpenSBI..."
+    make -C "${OPENSBI_DIR}" \
+        CROSS_COMPILE="${GNU_CC}" \
+        PLATFORM=generic \
+        FW_PAYLOAD_PATH="${LINUX_BUILD}/arch/riscv/boot/Image" \
+        FW_TEXT_START=0x1000000 \
+        K230_LITTLE_CORE=1 \
+        O="${OPENSBI_BUILD}" \
+        -j$(nproc)
+
+    # Use Nano3s DTB (dumped from factory device)
+    echo "[INFO] Using Nano3s DTB: ${NANO3S_DTB}"
+    if [ ! -f "${NANO3S_DTB}" ]; then
+        echo "[ERROR] Nano3s DTB not found: ${NANO3S_DTB}"
+        exit 1
+    fi
+    TMPD=$(mktemp -d)
+    cp "${NANO3S_DTB}" "${TMPD}/k230.dtb"
+
+    # Package: k230_gzip + mkimage(multi) + firmware_gen
+    echo "[INFO] Packaging linux_system.bin..."
+    cp "${FW_PAYLOAD}" "${TMPD}/fw_payload.bin"
+    cd "${TMPD}"
+
+    "${K230_GZIP}" -n8 -f -k fw_payload.bin \
+        || "${K230_GZIP}" -n9 -f -k fw_payload.bin \
+        || "${K230_GZIP}" -n7 -f -k fw_payload.bin \
+        || "${K230_GZIP}" -n6 -f -k fw_payload.bin
+    sed -i -e "1s/\x08/\x09/" fw_payload.bin.gz
+
+    echo a > rd
+
+    "${MKIMAGE}" -A riscv -O linux -T multi -C gzip \
+        -a 0x01000000 -e 0x01000000 -n linux \
+        -d fw_payload.bin.gz:rd:k230.dtb ulinux.bin
+
+    python3 "${FIRMWARE_GEN}" -i ulinux.bin -o "${OUTDIR}/linux_system.bin" -n
+
+    cd "${OPENSBI_DIR}"
+    rm -rf "${TMPD}"
+    echo "[INFO] linux_system.bin -> $(ls -lh ${OUTDIR}/linux_system.bin | awk '{print $5, $9}')"
 }
 
 cgminer_compile(){
-    ### build cgminer
-    BUILD_DIR="$SRC_DIR"/cg_miner/build
-    echo "[INFO] build is $BUILD_DIR"
-    if [ -d "$BUILD_DIR" ]; then
-        echo  "[INFO] $BUILD_DIR will be cleared "
-        rm -rf "$BUILD_DIR/"*
-    fi
+    local BUILD_DIR="${SRC_DIR}/cg_miner/build"
+    echo "[INFO] build dir: ${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    rm -rf "${BUILD_DIR:?}"/*
 
-    if [ -d "$BUILD_DIR" ]; then
-        echo "[INFO] Build dir: $BUILD_DIR"
-    else
-        mkdir -p "$BUILD_DIR"
-    fi
     echo && echo "[INFO] --------------------start cg_miner compile ------------------------"
-    cd $BUILD_DIR
-    cmake .. -DAVALON_CPU=$AVALON_CPU -DFW_VERSION=$FW_VERSION -DRELEASE_LVL=$RELEASE_LVL && make -j`nproc` || exit 1
+    cd "${BUILD_DIR}"
+    cmake .. -DAVALON_CPU="${AVALON_CPU}" -DFW_VERSION="${FW_VERSION}" -DRELEASE_LVL="${RELEASE_LVL}"
+    make -j"$(nproc)"
 }
 
-## model select
-MODEL_LIST=("NANO3S")
-echo && echo "[INFO] Please select Model [n]"
-for ((i=0; i<"${#MODEL_LIST[@]}"; i++)); do
-    echo "($i) ${MODEL_LIST[$i]}"
-done
-read -p "
-Your Choice [0]: " input
-[ "$input" == "" ] && input=0
-[[ $input =~ ^[+-]?[0-9]+$ ]] || (echo "[ABORT] Model select" && exit -1)
-if [ "$input" -ge "0" -a "$input" -lt "${#MODEL_LIST[@]}" ]; then
-    AVALON_MODEL="${MODEL_LIST[$input]}"
-    echo "[INFO] Model: $AVALON_MODEL"
-else
-    echo "[ABORT] Model select ($input)!!!"
-    exit -1
-fi
-
-## cpu 
+## cpu
 AVALON_CPU="k230"
 echo && echo "[INFO] CPU: $AVALON_CPU"
 
@@ -95,17 +263,28 @@ FW_VERSION="$input"
 echo && echo "[INFO] CGminer Version $FW_VERSION"
 
 ## release level:  0 - debug; 1 - release
-RLELEASE_STR=("debug" "release")
 RELEASE_LVL="0"
 echo && echo "[INFO] CGminer release level $RELEASE_LVL"
 echo
 
 prepare_toolchain
+prepare_musl_toolchain
 prepare_resource
+build_rtt_system
+build_linux_system
 cgminer_compile
 
-cp ${SRC_DIR}/cg_miner/build/cg_miner "${BUILDIMG_DIR}/app/release/linux/app"
-${SRC_DIR}/scripts/sdkbuild ${PRODUCT} ${FW_VERSION} ${COMMIT}
+cp "${SRC_DIR}/cg_miner/build/cg_miner" "${BUILDIMG_DIR}/app/release/linux/app"
+# Write release_version into app partition (read by rcS after mount)
+TARGETNAME="Avalon_${PRODUCT}_$(date "+%Y%m%d")${FW_VERSION}_${COMMIT}"
+mkdir -p "${BUILDIMG_DIR}/app/release/linux"
+cat > "${BUILDIMG_DIR}/app/release/linux/release_version" <<VERFEOF
+#############SDK VERSION######################################
+${TARGETNAME}
+##############################################################
+VERFEOF
+echo "[INFO] release_version: ${TARGETNAME}"
+"${SRC_DIR}/scripts/sdkbuild" "${PRODUCT}" "${FW_VERSION}" "${COMMIT}"
 
 echo
 echo "Build ${PRODUCT} Success !"
